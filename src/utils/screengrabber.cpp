@@ -9,9 +9,13 @@
 #include "src/utils/systemnotification.h"
 #include <QApplication>
 #include <QGuiApplication>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPixmap>
 #include <QProcess>
 #include <QScreen>
+#include <cmath>
 
 #if !(defined(Q_OS_MACOS) || defined(Q_OS_WIN))
 #include "request.h"
@@ -257,16 +261,16 @@ QPixmap ScreenGrabber::grabScreen(QScreen* screen, bool& ok)
 
 QRect ScreenGrabber::desktopGeometry()
 {
+    QRect hyprPhysical;
+    QRect hyprLogical;
+    if (hyprlandDesktopGeometries(hyprPhysical, hyprLogical)) {
+        return hyprPhysical;
+    }
+
     QRect geometry;
 
     for (QScreen* const screen : QGuiApplication::screens()) {
         QRect scrRect = screen->geometry();
-        // Qt6 fix: Don't divide by devicePixelRatio for multi-monitor setups
-        // This was causing coordinate offset issues in dual monitor
-        // configurations
-        // But it still has a screen position in real pixels, not logical ones
-        qreal dpr = screen->devicePixelRatio();
-        scrRect.moveTo(QPointF(scrRect.x() / dpr, scrRect.y() / dpr).toPoint());
         geometry = geometry.united(scrRect);
     }
     return geometry;
@@ -274,13 +278,100 @@ QRect ScreenGrabber::desktopGeometry()
 
 QRect ScreenGrabber::logicalDesktopGeometry()
 {
-    QRect geometry;
-    for (QScreen* const screen : QGuiApplication::screens()) {
-        QRect scrRect = screen->geometry();
-        scrRect.moveTo(scrRect.x(), scrRect.y());
-        geometry = geometry.united(scrRect);
+    QRect hyprPhysical;
+    QRect hyprLogical;
+    if (hyprlandDesktopGeometries(hyprPhysical, hyprLogical)) {
+        return hyprLogical;
     }
-    return geometry;
+
+    QRectF geometry;
+    for (QScreen* const screen : QGuiApplication::screens()) {
+        const QRect screenRect = screen->geometry();
+        const qreal dpr = screen->devicePixelRatio();
+        const QPointF logicalTopLeft(
+          static_cast<qreal>(screenRect.x()) / dpr,
+          static_cast<qreal>(screenRect.y()) / dpr);
+        const QSizeF logicalSize(
+          static_cast<qreal>(screenRect.width()) / dpr,
+          static_cast<qreal>(screenRect.height()) / dpr);
+        geometry = geometry.united(QRectF(logicalTopLeft, logicalSize));
+    }
+    return geometry.toAlignedRect();
+}
+
+bool ScreenGrabber::hyprlandDesktopGeometries(QRect& physical, QRect& logical)
+{
+#if defined(Q_OS_LINUX) || defined(Q_OS_UNIX)
+    if (!(m_info.waylandDetected() &&
+          m_info.windowManager() == DesktopInfo::HYPRLAND)) {
+        return false;
+    }
+
+    QProcess process;
+    process.start(QStringLiteral("hyprctl"),
+                  { QStringLiteral("monitors"), QStringLiteral("-j") });
+    if (!process.waitForFinished(1000)) {
+        AbstractLogger::warning()
+          << QObject::tr("Unable to query Hyprland monitors via hyprctl.");
+        return false;
+    }
+
+    const QByteArray output = process.readAllStandardOutput();
+    QJsonParseError parseError;
+    const QJsonDocument doc =
+      QJsonDocument::fromJson(output, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isArray()) {
+        AbstractLogger::warning()
+          << QObject::tr("Failed to parse hyprctl monitor output: %1")
+               .arg(parseError.errorString());
+        return false;
+    }
+
+    const auto toInt = [](double value) {
+        return static_cast<int>(std::llround(value));
+    };
+
+    QRect physicalUnion;
+    QRect logicalUnion;
+    bool gotMonitor = false;
+
+    for (const QJsonValueConstRef& value : doc.array()) {
+        if (!value.isObject()) {
+            continue;
+        }
+        const QJsonObject obj = value.toObject();
+        const double width = obj.value(QStringLiteral("width")).toDouble();
+        const double height = obj.value(QStringLiteral("height")).toDouble();
+        const double x = obj.value(QStringLiteral("x")).toDouble();
+        const double y = obj.value(QStringLiteral("y")).toDouble();
+        const double scale = obj.value(QStringLiteral("scale")).toDouble(1.0);
+        if (width <= 0 || height <= 0 || scale <= 0.0) {
+            continue;
+        }
+
+        const QRect physicalRect(toInt(x),
+                                 toInt(y),
+                                 toInt(width),
+                                 toInt(height));
+        const QRect logicalRect(toInt(x / scale),
+                                toInt(y / scale),
+                                toInt(width / scale),
+                                toInt(height / scale));
+        physicalUnion = physicalUnion.united(physicalRect);
+        logicalUnion = logicalUnion.united(logicalRect);
+        gotMonitor = true;
+    }
+
+    if (gotMonitor) {
+        physical = physicalUnion;
+        logical = logicalUnion;
+    }
+    return gotMonitor;
+#else
+    Q_UNUSED(physical);
+    Q_UNUSED(logical);
+    return false;
+#endif
 }
 
 void ScreenGrabber::adjustDevicePixelRatio(QPixmap& pixmap)

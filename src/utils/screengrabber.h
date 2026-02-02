@@ -21,6 +21,7 @@ public:
     QRect logicalDesktopGeometry();
 
 private:
+    bool hyprlandDesktopGeometries(QRect& physical, QRect& logical);
     void adjustDevicePixelRatio(QPixmap& pixmap);
     DesktopInfo m_info;
 };
